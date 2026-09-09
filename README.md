@@ -1,171 +1,143 @@
-# SecureFRL
+# CertiRank
 
-This repository contains the core implementation and efficiency-evaluation
-artifact for **SecureFRL: Efficient Privacy-Preserving Byzantine-Robust
-Federated Learning via Joint Training and Encryption Adaptation**.
+This repository contains the implementation and evaluation artifact for
+**CertiRank**, a privacy-preserving Byzantine-robust federated rank-learning
+framework.
 
-SecureFRL is a privacy-preserving Byzantine-robust federated learning scheme.
-It replaces real-valued encrypted model updates with integer ranking vectors,
-then performs verification and aggregation through lightweight additive
-homomorphic operations. The artifact includes a customized
-Microsoft SEAL/SEAL-Python stack and scripts for evaluating cryptographic and
-secure-aggregation overhead.
+CertiRank combines three components:
 
-## Artifact Scope
+1. **CMGRA** (Certified Membership-Gated Ranking Aggregation), which uses
+   top-$K$ membership support to certify selected--unselected boundary changes
+   and aggregated Borda scores to preserve fine-grained ordering;
+2. **SEncode**, a sign-aware coefficient encoder for joint ranking and
+   membership values; and
+3. **RLWE-AHE**, a lightweight additive homomorphic-encryption construction
+   supporting the additions and rotations required by the protocol.
 
-This repository provides:
+The repository provides both the cryptographic/system-efficiency artifact and
+the plaintext robustness simulator used for the experiments in the paper.
 
-- a customized SEAL/SEAL-Python binding for SecureFRL;
-- primitive benchmarks for encoding, encryption, addition, decryption,
-  decoding, and rotation;
-- aggregation-efficiency scripts for SecureFRL and secure baselines.
-
-## Repository Structure
+## Repository structure
 
 ```text
-SecureFRL/
+CertiRank/
 |-- README.md
 |-- Efficiency evaluation/
-|   |-- securefrl.py              # SecureFRL aggregation-efficiency script
-|   |-- securefrl-bfv.py          # SecureFRL with standard BFV
-|   |-- bcpbfl.py                 # CKKS-based BCPBFL-style baseline
-|   |-- rvfl.py                   # Paillier/HEU-based RVPFL-style baseline
-|   |-- paillier_test.py          # Paillier primitive benchmark
-|   |-- comparison.py             # RLWE-AHE/BGV/BFV/CKKS primitive benchmark
-|   |-- rotation.py               # Rotation benchmark and plot generation
-|   |-- cleaned_results_*.csv     # Cleaned rotation results
-|   `-- seal.cpython-310-x86_64-linux-gnu.so
-`-- SEAL-Python/
-    |-- SEAL/                     # Customized Microsoft SEAL source tree
-    |-- pybind11/
-    |-- src/wrapper.cpp           # Python binding definitions
-    |-- setup.py
-    `-- Dockerfile
+|   |-- README.md
+|   |-- certirank.py             # SEncode + RLWE-AHE + CMGRA workflow
+|   |-- certirank-bfv.py         # BFV native encoding + BFV + CMGRA workflow
+|   |-- bcpbfl.py                # CKKS-based BCPBFL baseline
+|   |-- rvfl.py                  # Paillier/HEU-based RVPFL baseline
+|   |-- comparison.py            # cryptographic primitive benchmarks
+|   |-- rotation.py              # rotation benchmark
+|   `-- seal*.so                 # bundled Linux/Python 3.10 binding
+|-- Robustness evaluation/
+|   |-- README.md
+|   |-- run_benchmark.py
+|   |-- cmgra.py
+|   |-- VEM.py
+|   |-- benchmark/               # datasets, models, attacks, and aggregators
+|   |-- tests/
+|   `-- requirements.txt
+`-- SEAL-Python/                 # customized Microsoft SEAL binding
 ```
 
-Key implementation files:
+## Experimental scope
 
-- `SEAL-Python/SEAL/native/src/seal/encryptionparams.h`: adds
-  `encoding_method`;
-- `SEAL-Python/SEAL/native/src/seal/batchencoder.cpp`: implements the custom
-  `encoding_method.pm` path;
-- `SEAL-Python/src/wrapper.cpp`: exposes the customized SEAL APIs to Python.
+The robustness evaluation uses the following matched dataset/model pairs:
 
-## Requirements
+| Dataset | Model | Ranked parameters |
+| --- | --- | ---: |
+| MNIST | Conv2 | 1,682,496 |
+| SVHN | Conv8 | 5,275,840 |
+| CIFAR10 | ResNet18 | 11,164,352 |
 
-The paper experiments were run on Ubuntu 22.04.1 LTS with an Intel Xeon
-Platinum 8481C CPU, an NVIDIA RTX 4090 GPU, and 90 GB RAM.
+Each dataset is partitioned among 1,000 clients with a Dirichlet distribution
+($\alpha=1.0$). In each global round, 25 clients participate. The reported
+experiments run for 500 global rounds and consider 10%, 20%, and 30% malicious
+clients.
 
-For the efficiency artifact, a Linux x86_64 environment is recommended because
-the repository includes a prebuilt Python 3.10 Linux shared object for `seal`.
-The GPU is not required for the provided efficiency scripts.
+The artifact implements FedAvg, BCPBFL, RVPFL, FRL, and CMGRA. It supports
+Label Flipping, Gradient Ascent, Pixel Backdoor, and the ranking-specific VEM
+attack. VEM is applicable only to FRL and CMGRA.
 
-Required software:
-
-- Python 3.10 recommended;
-- CMake >= 3.16;
-- GCC/G++ >= 9.4 or Clang++ >= 10.0;
-- Python packages: `numpy`, `tqdm`, `matplotlib`, `psutil`, `scipy`;
-- optional for Paillier/RVPFL baselines: SecretFlow HEU, importable as
-  `from heu import phe`;
-- optional for full FL training experiments: PyTorch.
-
-Install common Python dependencies:
+## Quick start: robustness experiments
 
 ```bash
-python3 -m pip install -U pip
-python3 -m pip install numpy tqdm matplotlib psutil scipy
+cd "Robustness evaluation"
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+
+python3 -m benchmark.vem_partition \
+  --dataset cifar10 --n-clients 1000 --alpha 1.0 --seed 0 \
+  --root benchmark_data --download \
+  --output partitions/cifar10_dirichlet_a1_seed0.pkl
+
+# Example: CIFAR10 + ResNet18, CMGRA, 20% VEM clients, 500 rounds
+python3 run_benchmark.py \
+  --dataset cifar10 \
+  --model resnet18 \
+  --method cmgra-px \
+  --attack vem \
+  --malicious-fraction 0.2 \
+  --n-clients 1000 \
+  --round-clients 25 \
+  --rounds 500 \
+  --data-partition legacy-vem \
+  --partition-file partitions/cifar10_dirichlet_a1_seed0.pkl \
+  --local-epochs 5 \
+  --keep-ratio 0.5 \
+  --cmgra-borda-final-order \
+  --device cuda
 ```
 
-## Setup
+The CLI identifier `cmgra-px` is retained for compatibility with the original
+experiment logs; it denotes the method named **CMGRA** in the paper.
+Checkpoints, `metrics.csv`, `summary.json`, and accuracy plots are written under
+the selected output directory. See
+[`Robustness evaluation/README.md`](Robustness%20evaluation/README.md) for the
+complete commands and attack settings.
 
-### Use the bundled binding
+## Quick start: efficiency experiments
 
-On Linux x86_64 with Python 3.10:
+The efficiency artifact targets Linux x86_64 and Python 3.10. A GPU is not
+required.
 
 ```bash
 cd "Efficiency evaluation"
 python3 -c "from seal import *; print('SEAL-Python is ready')"
+python3 certirank.py
+python3 certirank-bfv.py
 ```
 
-### Build SEAL-Python from source
+CertiRank uses SEncode and RLWE-AHE. CertiRank-BFV encodes the same logical
+joint ranking--membership vector with BFV's native batching encoder and then
+uses BFV encryption; it retains CMGRA and the same high-level protocol
+workflow, but it does **not** use SEncode.
 
-Use this if the bundled `seal*.so` is incompatible with your environment.
+See [`Efficiency evaluation/README.md`](Efficiency%20evaluation/README.md) for
+the build procedure and individual benchmark commands.
 
-```bash
-cd SEAL-Python
-python3 -m pip install numpy pybind11 wheel setuptools
+## Software requirements
 
-cd SEAL
-cmake -S . -B build \
-  -DSEAL_USE_MSGSL=OFF \
-  -DSEAL_USE_ZLIB=OFF \
-  -DSEAL_USE_ZSTD=OFF
-cmake --build build -j
+Robustness experiments require Python 3.10 or newer, PyTorch, torchvision,
+NumPy, SciPy, Pillow, and Matplotlib. Cryptographic experiments additionally
+require the customized SEAL-Python binding. HEU is optional and is needed only
+for the Paillier/RVPFL efficiency baseline.
 
-cd ..
-python3 setup.py build_ext -i
-cp seal*.so "../Efficiency evaluation/"
-```
+## Reproducibility notes
 
-## Running Benchmarks
+- Datasets are downloaded by torchvision and are not included in this
+  repository.
+- Random seeds, client partitions, sampled clients, and attack parameters are
+  recorded in every run's `config.json`.
+- Rank-based experiments optimize Edge-Popup scores over fixed weights. The
+  number of communicated ranks equals the number of fixed network weights.
+- The bundled `seal*.so` is platform-specific. Rebuild the binding from
+  `SEAL-Python/` when using a different Python or operating-system version.
 
-Run scripts from `Efficiency evaluation/` so that Python can import the local
-`seal` module.
+## Third-party software
 
-```bash
-cd "Efficiency evaluation"
-```
-
-| Script | Purpose |
-| --- | --- |
-| `python3 comparison.py` | Primitive benchmark for RLWE-AHE, BGV, BFV, and CKKS |
-| `python3 rotation.py` | Rotation benchmark; writes `rotation_time_*.png/.pdf` and `cleaned_results_*.csv` |
-| `python3 securefrl.py` | SecureFRL aggregation-efficiency benchmark |
-| `python3 securefrl-bfv.py` | SecureFRL variant with standard BFV |
-| `python3 bcpbfl.py` | CKKS-based BCPBFL-style baseline |
-| `python3 paillier_test.py` | Paillier primitive benchmark, requires HEU |
-| `python3 rvfl.py` | Paillier/HEU-based RVPFL-style baseline, requires HEU |
-
-The scripts print timing summaries such as per-client encoding/encryption
-time, robust aggregation time, and decryption/decoding time.
-
-## Experimental Parameters
-
-The main script constants can be changed at the top of each file:
-
-- `NUM_CLIENTS`: number of participating clients;
-- `POLY_MOD_DEGREE`: polynomial modulus degree;
-- `PLAIN_MOD_BIT_SIZE`: plaintext modulus bit size;
-- `REP`: number of primitive-benchmark repetitions;
-- `mnist_layer`, `svhn_layer`, `cifar10_layer`: model-layer profiles.
-
-Paper settings:
-
-- datasets: MNIST, SVHN, CIFAR10;
-- data distribution: 500 clients, uniformly partitioned;
-- selected clients per round: `U = 5`, `15`, or `25` for efficiency tests;
-- robustness tests: `U = 25`, 300 global iterations;
-- models: LeNet for MNIST, Conv8 for SVHN, ResNet18 for CIFAR10;
-- RLWE-based polynomial degree: `N = 8192`;
-- plaintext modulus: 35 bits;
-- RLWE-AHE ciphertext modulus: 60-bit prime modulus;
-- CKKS scale: `2^40`;
-- Paillier modulus: 2048 bits.
-
-
-## Notes
-
-- Random seeds are not fixed by default. Add `numpy.random.seed(...)` for
-  deterministic local runs.
-- `comparison.py` and `rotation.py` set CPU affinity to logical core 64. Change
-  or remove this line if your machine has fewer cores.
-- Large profiles, especially CIFAR10/ResNet18, can require substantial runtime
-  and memory. Reduce `NUM_CLIENTS`, `REP`, or the active layer profile for a
-  quick smoke test.
-
-## License and Citation
-
-Third-party components retain their original licenses, including Microsoft
-SEAL, pybind11, and SEAL-Python. Project-level citation information will be
-added after de-anonymization.
+Microsoft SEAL, pybind11, and SEAL-Python retain their respective upstream
+licenses. Project citation metadata will be added after de-anonymization.

@@ -1,0 +1,6 @@
+matplotlib>=3.8,<4
+numpy>=1.26,<3
+pillow>=10,<13
+scipy>=1.11,<2
+torch>=2.3,<3
+torchvision>=0.18,<1
