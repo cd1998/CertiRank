@@ -40,7 +40,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--plain-modulus-bits", type=int, default=35)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.clients <= 0:
+        parser.error("--clients must be positive")
+    if args.repetitions <= 0:
+        parser.error("--repetitions must be positive")
+    if args.keep_ratio is not None and not 0.0 <= args.keep_ratio <= 1.0:
+        parser.error("--keep-ratio must be in [0, 1]")
+    return args
 
 
 def _setup(backend: str, degree: int, plain_bits: int):
@@ -197,15 +204,29 @@ def _run_once(backend: str, args: argparse.Namespace, crypto, rng):
         encrypted_clients.append(ciphertexts)
     submit_time = time.perf_counter() - start
 
-    # S1 obfuscates a copy; S2 decrypts and validates the joint representation.
+    # S1 obfuscates a copy in two stages; S2 decrypts and validates the joint
+    # representation.  Chunks are shuffled independently for every client.
+    # The layer label and valid length are retained, but the original chunk
+    # position within that layer is not exposed to S2.
     start = time.perf_counter()
     qualified = []
     for client_index, ciphertexts in enumerate(encrypted_clients):
         recovered = [[] for _ in layer_sizes]
         valid = True
-        for index, ((layer_index, valid_length), shift) in enumerate(
-            zip(metadata, shifts)
-        ):
+        shuffled_indices = []
+        for layer_index in range(len(layer_sizes)):
+            layer_indices = np.asarray(
+                [
+                    index
+                    for index, (owner, _) in enumerate(metadata)
+                    if owner == layer_index
+                ],
+                dtype=np.int64,
+            )
+            shuffled_indices.extend(rng.permutation(layer_indices).tolist())
+        for index in shuffled_indices:
+            layer_index, valid_length = metadata[index]
+            shift = shifts[index]
             obfuscated = _obfuscate(
                 ciphertexts[index],
                 int(shift),
@@ -271,6 +292,8 @@ def _run_once(backend: str, args: argparse.Namespace, crypto, rng):
 
 
 def main(backend: str) -> None:
+    if backend not in {"rlwe-ahe", "bfv"}:
+        raise ValueError("backend must be 'rlwe-ahe' or 'bfv'")
     args = _parse_args()
     rng = np.random.default_rng(args.seed)
     crypto = _setup(backend, args.poly_degree, args.plain_modulus_bits)

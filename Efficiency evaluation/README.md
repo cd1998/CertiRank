@@ -5,11 +5,14 @@ and per-round secure-aggregation overhead.
 
 ## CertiRank variants
 
-- `certirank.py`: SEncode coefficient encoding, RLWE-AHE encryption, and the
-  CertiRank secure workflow.
+- `certirank.py`: CertiRank command-line entry point.
 - `certirank-bfv.py`: BFV native batch encoding and BFV encryption over the
   same logical joint ranking--membership representation and CMGRA workflow.
   This variant does not invoke SEncode.
+- `certirank_benchmark.py`: the shared, complete implementation of client
+  packing/encryption, S1 obfuscation and aggregation, S2 validation and
+  decryption, and client-side aggregate recovery. Both launchers call this
+  module so that their protocol paths cannot drift apart.
 
 In both variants, a client first derives a $K$-hot membership vector from each
 ranking and packs the pair logically as
@@ -56,5 +59,13 @@ The model-layer profiles used by the paper are:
 - SVHN/Conv8: 5,275,840 ranked parameters;
 - CIFAR10/ResNet18: 11,164,352 ranked parameters.
 
-Change `NUM_CLIENTS` and the active layer profile at the beginning of each
-benchmark script when reproducing a different table entry.
+Select the dataset profile and number of participating clients through the
+command line. For example:
+
+```bash
+python3 certirank.py --dataset cifar10 --clients 25 --repetitions 3
+python3 certirank-bfv.py --dataset cifar10 --clients 25 --repetitions 3
+```
+
+Use `--help` to list all available parameters. No source-code constants need
+to be edited to reproduce a table entry.

@@ -1,11 +1,10 @@
-"""Matched LeNet, Conv4, Conv8, and CIFAR-ResNet18 model families.
+"""The paper's matched Conv2, Conv8, and CIFAR-ResNet18 models.
 
 The gradient methods optimize ordinary weights.  The rank methods optimize
-Edge-Popup scores over fixed weights.  Signed-constant weights match the
-published VEM/FRL training entry point and remain the default; Kaiming-uniform
-weights are retained only for initialization ablations.  The score tensor has
-exactly the same shape as the corresponding trainable weight tensor, which
-keeps the communicated parameter counts aligned across the two paradigms.
+Edge-Popup scores over fixed weights.  The paper uses signed-constant weights
+for MNIST and CIFAR10 and Kaiming-uniform fixed weights for SVHN.  Each score
+tensor has exactly the same shape as the corresponding trainable weight
+tensor, keeping communicated parameter counts aligned across paradigms.
 """
 
 from __future__ import annotations
@@ -96,42 +95,6 @@ def _norm(rank_based: bool, channels: int) -> nn.Module:
     )
 
 
-class LeNet(nn.Module):
-    def __init__(
-        self,
-        rank_based: bool,
-        keep_ratio: float,
-        num_classes: int = 10,
-        hidden_width: int = 128,
-    ):
-        super().__init__()
-        self.convs = nn.Sequential(
-            _conv(rank_based, keep_ratio, 1, 32, 3, padding=1),
-            nn.ReLU(inplace=True),
-            _conv(rank_based, keep_ratio, 32, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-        )
-        self.linear = nn.Sequential(
-            _conv(
-                rank_based,
-                keep_ratio,
-                64 * 14 * 14,
-                hidden_width,
-                1,
-            ),
-            nn.ReLU(inplace=True),
-            _conv(
-                rank_based, keep_ratio, hidden_width, num_classes, 1
-            ),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.convs(x)
-        x = x.reshape(x.shape[0], 64 * 14 * 14, 1, 1)
-        return self.linear(x).flatten(1)
-
-
 class Conv2(nn.Module):
     """The two-convolution MNIST model used by the published VEM code."""
 
@@ -154,53 +117,6 @@ class Conv2(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.convs(x)
         x = x.reshape(x.shape[0], 128 * 7 * 7, 1, 1)
-        return self.linear(x).flatten(1)
-
-
-class Conv4(nn.Module):
-    """Four-stage CIFAR model used for the network-size ablation.
-
-    Conv4 preserves Conv8's channel progression, four spatial downsamplings,
-    and classifier head while retaining only one 3x3 convolution per stage.
-    This isolates convolutional depth without changing the input/output shape
-    or the rank-aggregation implementation.
-    """
-
-    def __init__(
-        self,
-        rank_based: bool,
-        keep_ratio: float,
-        batchnorm: bool = False,
-    ):
-        super().__init__()
-        channels = (3, 64, 128, 256, 512)
-        layers = []
-        for in_channels, out_channels in zip(channels, channels[1:]):
-            layers.append(
-                _conv(
-                    rank_based,
-                    keep_ratio,
-                    in_channels,
-                    out_channels,
-                    3,
-                    padding=1,
-                )
-            )
-            if batchnorm:
-                layers.append(_norm(rank_based, out_channels))
-            layers.extend([nn.ReLU(inplace=True), nn.MaxPool2d(2)])
-        self.convs = nn.Sequential(*layers)
-        self.linear = nn.Sequential(
-            _conv(rank_based, keep_ratio, 512 * 2 * 2, 256, 1),
-            nn.ReLU(inplace=True),
-            _conv(rank_based, keep_ratio, 256, 256, 1),
-            nn.ReLU(inplace=True),
-            _conv(rank_based, keep_ratio, 256, 10, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.convs(x)
-        x = x.reshape(x.shape[0], 512 * 2 * 2, 1, 1)
         return self.linear(x).flatten(1)
 
 
@@ -350,103 +266,6 @@ class CIFARResNet(nn.Module):
         return self.linear(out).flatten(1)
 
 
-class WideBasicBlock(nn.Module):
-    """Pre-activation block used by WideResNet on 32x32 images."""
-
-    def __init__(
-        self,
-        rank_based: bool,
-        keep_ratio: float,
-        in_planes: int,
-        planes: int,
-        stride: int,
-    ):
-        super().__init__()
-        self.bn1 = _norm(rank_based, in_planes)
-        self.conv1 = _conv(
-            rank_based, keep_ratio, in_planes, planes, 3, stride, 1
-        )
-        self.bn2 = _norm(rank_based, planes)
-        self.conv2 = _conv(
-            rank_based, keep_ratio, planes, planes, 3, 1, 1
-        )
-        self.shortcut = (
-            _conv(rank_based, keep_ratio, in_planes, planes, 1, stride, 0)
-            if stride != 1 or in_planes != planes
-            else nn.Identity()
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        activated = F.relu(self.bn1(x), inplace=True)
-        out = self.conv1(activated)
-        out = self.conv2(F.relu(self.bn2(out), inplace=True))
-        shortcut_input = activated if not isinstance(
-            self.shortcut, nn.Identity
-        ) else x
-        return out + self.shortcut(shortcut_input)
-
-
-class WideResNet(nn.Module):
-    """WideResNet-28-k adapted to score/rank training."""
-
-    def __init__(
-        self,
-        rank_based: bool,
-        keep_ratio: float,
-        in_channels: int,
-        num_classes: int,
-        widen_factor: int = 6,
-    ):
-        super().__init__()
-        blocks_per_group = 4  # depth = 6 * 4 + 4 = 28
-        channels = (16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor)
-        self.rank_based = rank_based
-        self.keep_ratio = keep_ratio
-        self.in_planes = channels[0]
-        self.conv1 = _conv(
-            rank_based, keep_ratio, in_channels, channels[0], 3, 1, 1
-        )
-        self.group1 = self._make_group(
-            channels[1], blocks_per_group, 1
-        )
-        self.group2 = self._make_group(
-            channels[2], blocks_per_group, 2
-        )
-        self.group3 = self._make_group(
-            channels[3], blocks_per_group, 2
-        )
-        self.bn = _norm(rank_based, channels[3])
-        self.linear = _conv(
-            rank_based, keep_ratio, channels[3], num_classes, 1
-        )
-
-    def _make_group(
-        self, planes: int, blocks: int, first_stride: int
-    ) -> nn.Sequential:
-        layers = []
-        for stride in [first_stride] + [1] * (blocks - 1):
-            layers.append(
-                WideBasicBlock(
-                    self.rank_based,
-                    self.keep_ratio,
-                    self.in_planes,
-                    planes,
-                    stride,
-                )
-            )
-            self.in_planes = planes
-        return nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv1(x)
-        out = self.group1(out)
-        out = self.group2(out)
-        out = self.group3(out)
-        out = F.relu(self.bn(out), inplace=True)
-        out = F.adaptive_avg_pool2d(out, 1)
-        return self.linear(out).flatten(1)
-
-
 MODEL_FOR_DATASET = {
     "mnist": "conv2",
     "svhn": "conv8",
@@ -471,7 +290,7 @@ def build_model(
     rank_based: bool,
     keep_ratio: float = 0.5,
     rank_weight_init: str = "signed-constant",
-    svhn_batchnorm: bool = False,
+    conv_batchnorm: bool = False,
     model_name: str = "auto",
 ) -> nn.Module:
     dataset = dataset.lower()
@@ -481,21 +300,8 @@ def build_model(
 
     if model_name == "conv2":
         model = Conv2(rank_based, keep_ratio)
-    elif model_name == "lenet":
-        model = LeNet(
-            rank_based, keep_ratio, DATASET_NUM_CLASSES[dataset]
-        )
-    elif model_name == "lenet-wide-160":
-        model = LeNet(
-            rank_based,
-            keep_ratio,
-            DATASET_NUM_CLASSES[dataset],
-            hidden_width=160,
-        )
-    elif model_name == "conv4":
-        model = Conv4(rank_based, keep_ratio, batchnorm=svhn_batchnorm)
     elif model_name == "conv8":
-        model = Conv8(rank_based, keep_ratio, batchnorm=svhn_batchnorm)
+        model = Conv8(rank_based, keep_ratio, batchnorm=conv_batchnorm)
     elif model_name == "resnet18":
         model = CIFARResNet(
             rank_based,
@@ -503,30 +309,6 @@ def build_model(
             DATASET_INPUT_CHANNELS[dataset],
             DATASET_NUM_CLASSES[dataset],
             (2, 2, 2, 2),
-        )
-    elif model_name == "resnet34":
-        model = CIFARResNet(
-            rank_based,
-            keep_ratio,
-            DATASET_INPUT_CHANNELS[dataset],
-            DATASET_NUM_CLASSES[dataset],
-            (3, 4, 6, 3),
-        )
-    elif model_name == "wideresnet28x6":
-        model = WideResNet(
-            rank_based,
-            keep_ratio,
-            DATASET_INPUT_CHANNELS[dataset],
-            DATASET_NUM_CLASSES[dataset],
-            widen_factor=6,
-        )
-    elif model_name == "wideresnet28x10":
-        model = WideResNet(
-            rank_based,
-            keep_ratio,
-            DATASET_INPUT_CHANNELS[dataset],
-            DATASET_NUM_CLASSES[dataset],
-            widen_factor=10,
         )
     else:
         raise ValueError(f"unknown model: {model_name}")
@@ -536,8 +318,7 @@ def build_model(
             f"unknown rank weight initialization: {rank_weight_init}"
         )
     if rank_based and rank_weight_init == "kaiming-uniform":
-        # This is an explicit ablation.  The source training entry point
-        # overrides Builder's CLI default with signed_constant.
+        # The SVHN/Conv8 profile uses this fixed-weight initialization.
         with torch.no_grad():
             for module in scored_modules(model).values():
                 nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))

@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 import VEM
-from cmgra import CMGRAAggregator, CMGRAUpdateBatch, retained_edge_count
+from cmgra import CMGRAAggregator, retained_edge_count
 
 from . import (
     ALL_ATTACKS,
@@ -39,11 +39,11 @@ from .data import (
     root_loader,
     stamp_trigger,
     test_loader,
-    validation_loader,
 )
 
 from .aggregators import TensorList, bcpbfl, fedavg, rvpfl
 from .models import (
+    MODEL_FOR_DATASET,
     build_model,
     communicated_parameter_count,
     scored_modules,
@@ -70,53 +70,24 @@ class RunConfig:
     test_batch_size: int
     local_lr: float
     lr_decay: float
-    global_cosine_start: int
-    global_min_lr: float
     momentum: float
     weight_decay: float
     local_cosine: bool
     keep_ratio: float
     rank_weight_init: str
-    svhn_batchnorm: bool
+    conv_batchnorm: bool
     bcp_server_lr: float
     root_size: int
-    noise_scale: float
-    # Retained only so checkpoints written before the attack was removed
-    # remain resumable. It is not associated with any supported attack.
-    shuffle_scale: float
-    label_flip_target: int
-    backdoor_fraction: float
     backdoor_target: int
     trigger_size: int
     backdoor_examples: int
     cmgra_seed: int
-    cmgra_pairwise: bool
-    cmgra_pair_matching: str
-    cmgra_preserve_order: bool
-    cmgra_membership_order: bool
-    cmgra_borda_order: bool
-    cmgra_borda_final_order: bool
-    cmgra_count_ema: float
-    cmgra_swap_cap: int
-    cmgra_persistence_rounds: int
-    cmgra_update_interval: int
-    cmgra_borda_mode: str
-    cmgra_rank_buckets: int
-    cmgra_borda_ema: float
-    cmgra_prior_rank_weight: float
-    cmgra_hybrid_mode: str
-    cmgra_hybrid_warmup_rounds: int
-    cmgra_hybrid_val_window: int
-    cmgra_hybrid_val_drop: float
-    cmgra_hybrid_patience: int
     vem_lr: float
     vem_epochs: int
     vem_max_window: int
     vem_temperature: float
     vem_sinkhorn_iterations: int
     vem_noise: float
-    vem_source_compatible: bool
-    rvpfl_paper_extra_division: bool
     checkpoint_interval: int
     data_root: str
     output_root: str
@@ -138,25 +109,9 @@ def _set_seed(seed: int) -> None:
 
 
 def _round_learning_rate(config: RunConfig, round_index: int) -> float:
-    """Return the base LR for one communication round.
+    """Return the exponentially decayed learning rate for one round."""
 
-    The legacy schedule remains the default.  When ``global_cosine_start`` is
-    non-negative, the same exponential schedule is used before that round and
-    then decays smoothly from its value at the transition to
-    ``global_min_lr`` at the final communication round.
-    """
-
-    if config.global_cosine_start < 0:
-        return config.local_lr * (config.lr_decay**round_index)
-    start = config.global_cosine_start
-    if round_index < start:
-        return config.local_lr * (config.lr_decay**round_index)
-    start_lr = config.local_lr * (config.lr_decay**start)
-    denominator = max(config.rounds - 1 - start, 1)
-    progress = min(max((round_index - start) / denominator, 0.0), 1.0)
-    return config.global_min_lr + 0.5 * (
-        start_lr - config.global_min_lr
-    ) * (1.0 + math.cos(math.pi * progress))
+    return config.local_lr * (config.lr_decay**round_index)
 
 
 def _fraction_tag(value: float) -> str:
@@ -191,7 +146,7 @@ def selected_clients(config: RunConfig, round_index: int) -> Tuple[np.ndarray, s
         _stable_seed("participants", config.seed, round_index)
     )
     users = rng.choice(config.n_clients, config.round_clients, replace=False)
-    if config.attack == "vem" and config.vem_source_compatible:
+    if config.attack == "vem":
         # VEM-master/FL_train.py fixes the number of malicious uploads in
         # every round with int(round_nclients * at_fractions).  Preserve that
         # behaviour, including floor rounding for fractions such as 10%.
@@ -220,35 +175,6 @@ def _model_delta(local: nn.Module, global_model: nn.Module) -> TensorList:
             _parameter_list(local), _parameter_list(global_model)
         )
     ]
-
-
-def _append_backdoor_copies(
-    images: torch.Tensor,
-    labels: torch.Tensor,
-    config: RunConfig,
-    generator: torch.Generator,
-    copies: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if copies <= 0:
-        return images, labels
-    candidates = torch.arange(labels.numel(), device=labels.device)
-    order = torch.randperm(
-        candidates.numel(), generator=generator, device=images.device
-    )
-    selected = candidates[order[: min(copies, candidates.numel())]]
-    poisoned = stamp_trigger(
-        images[selected], config.dataset, config.trigger_size
-    )
-    target = torch.full(
-        (poisoned.shape[0],),
-        config.backdoor_target,
-        device=labels.device,
-        dtype=labels.dtype,
-    )
-    return (
-        torch.cat((images, poisoned), dim=0),
-        torch.cat((labels, target), dim=0),
-    )
 
 
 def _train_local_model(
@@ -281,33 +207,13 @@ def _train_local_model(
     )
     _set_seed(local_seed)
     device = next(local.parameters()).device
-    generator = torch.Generator(device=device)
-    generator.manual_seed(local_seed + 17)
 
     for _ in range(config.local_epochs):
-        backdoor_seen = 0
         for images, labels in loader:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, dtype=torch.long, non_blocking=True)
             if malicious and config.attack == "label_flip":
                 labels = config_num_classes(config) - labels - 1
-            elif malicious and config.attack == "label_flip_all_to_one":
-                labels = torch.full_like(labels, config.label_flip_target)
-            elif malicious and config.attack == "pixel_backdoor":
-                desired_before = math.floor(
-                    backdoor_seen * config.backdoor_fraction + 1e-9
-                )
-                backdoor_seen += images.shape[0]
-                desired_after = math.floor(
-                    backdoor_seen * config.backdoor_fraction + 1e-9
-                )
-                images, labels = _append_backdoor_copies(
-                    images,
-                    labels,
-                    config,
-                    generator,
-                    desired_after - desired_before,
-                )
             optimizer.zero_grad(set_to_none=True)
             logits = local(images)
             loss = criterion(logits, labels)
@@ -323,21 +229,6 @@ def _train_local_model(
 def config_num_classes(config: RunConfig) -> int:
     del config
     return 10
-
-
-def _add_gaussian_noise(
-    tensors: Sequence[torch.Tensor], scale: float, seed: int
-) -> TensorList:
-    _set_seed(seed)
-    squared = torch.zeros((), device=tensors[0].device, dtype=torch.float64)
-    dimensions = 0
-    for tensor in tensors:
-        squared += tensor.double().square().sum()
-        dimensions += tensor.numel()
-    rms = torch.sqrt(squared / max(dimensions, 1)).to(tensors[0].dtype)
-    return [
-        tensor + torch.randn_like(tensor) * rms * scale for tensor in tensors
-    ]
 
 
 def _rank_values(scores: torch.Tensor) -> torch.Tensor:
@@ -376,25 +267,12 @@ def _rank_upload(
     upload = {}
     for layer_index, (name, module) in enumerate(scored_modules(local).items()):
         scores = module.scores.detach()
-        if config.attack == "vem" and config.vem_source_compatible:
+        if config.attack == "vem":
             # VEM-master creates r_s with Find_rank(raw_scores).  This
             # benchmark stores all server uploads canonically as per-edge
             # rank values, so materialize the exact row that the source
             # FRL_Vote obtains after its torch.sort(...)[1].
             upload[name] = _vem_source_rank_values(scores)
-        elif malicious and config.attack == "gaussian_noise":
-            noisy = _add_gaussian_noise(
-                [scores],
-                config.noise_scale,
-                _stable_seed(
-                    "rank-noise",
-                    config.seed,
-                    round_index,
-                    client_id,
-                    layer_index,
-                ),
-            )[0]
-            upload[name] = _rank_values(noisy)
         else:
             upload[name] = _rank_values(scores)
     return upload
@@ -428,7 +306,6 @@ def _aggregate_rank_round(
     round_index: int,
     cmgra: CMGRAAggregator | None,
     vem_state: MutableMapping[str, Dict[str, torch.Tensor]],
-    force_frl: bool = False,
 ) -> Dict[str, object]:
     uploads = [dict(upload) for upload in uploads]
     vem_audit = ""
@@ -449,8 +326,7 @@ def _aggregate_rank_round(
             )
             try:
                 has_history = (
-                    config.vem_source_compatible
-                    and round_index > 0
+                    round_index > 0
                     and name in vem_state["global_orders"]
                     and name in vem_state["malicious_rankings"]
                 )
@@ -489,18 +365,11 @@ def _aggregate_rank_round(
                     f"VEM failed at layer {name!r}, round {round_index + 1}"
                 ) from exc
 
-            if config.vem_source_compatible:
-                # The source VEM routine returns per-edge rank values, while
-                # its FRL_Vote path applies torch.sort(...)[1] once more before
-                # Borda summation.  Reproduce that server-visible permutation
-                # exactly while keeping the benchmark's canonical rank-value
-                # representation for every uploaded row.
-                server_visible = torch.sort(attacked, dim=1)[1]
-                vem_state["malicious_rankings"][name] = (
-                    attacked.detach().clone()
-                )
-            else:
-                server_visible = attacked
+            # The source VEM routine returns per-edge rank values, while its
+            # FRL_Vote path applies torch.sort(...)[1] once more before Borda
+            # summation. Reproduce that server-visible permutation exactly.
+            server_visible = torch.sort(attacked, dim=1)[1]
+            vem_state["malicious_rankings"][name] = attacked.detach().clone()
 
             changed = int((server_visible != source_rank_values).sum().item())
             total = int(source_rank_values.numel())
@@ -523,17 +392,17 @@ def _aggregate_rank_round(
                     torch.int32
                 )
 
-    # CMGRA-PX is threat-budget adaptive.  With a certified adversary bound
+    # CMGRA is threat-budget adaptive. With a certified adversary bound
     # m=0 there is no boundary attack to reject, so retain exact compatibility
     # with the original FRL Borda update.  Besides avoiding unnecessary
     # membership-boundary churn, this makes the clean arm measure the cost of
     # the defence without changing FRL's benign optimization trajectory.
     clean_borda_compat = (
-        config.method == "cmgra-px"
+        config.method == "cmgra"
         and config.attack == "clean"
         and not malicious_rows
     )
-    if force_frl or config.method == "frl" or clean_borda_compat:
+    if config.method == "frl" or clean_borda_compat:
         global_ranks = {}
         for name in scored_modules(model):
             borda = torch.stack(
@@ -546,7 +415,7 @@ def _aggregate_rank_round(
             )
             global_ranks[name] = ranks
         _apply_rank_values(model, score_levels, global_ranks)
-        if config.attack == "vem" and config.vem_source_compatible:
+        if config.attack == "vem":
             for name, module in scored_modules(model).items():
                 vem_state["global_orders"][name] = _vem_source_edge_order(
                     module.scores.detach()
@@ -560,10 +429,7 @@ def _aggregate_rank_round(
             "fallback": (
                 "clean_borda_compat"
                 if clean_borda_compat
-                else (
-                    ("hybrid_frl|" if force_frl else "")
-                    + ("source_vem|" + vem_audit if vem_audit else "")
-                )
+                else ("source_vem|" + vem_audit if vem_audit else "")
             ),
         }
 
@@ -573,16 +439,13 @@ def _aggregate_rank_round(
     summaries = {}
     with torch.no_grad():
         for name, module in scored_modules(model).items():
-            dimensions = uploads[0][name].numel()
-            keep = retained_edge_count(dimensions, config.keep_ratio)
             rankings = torch.stack(
                 [upload[name].long() for upload in uploads],
                 dim=0,
             )
-            memberships = rankings >= (dimensions - keep)
             result = cmgra.aggregate_layer(
                 name,
-                CMGRAUpdateBatch(rankings, memberships),
+                rankings,
                 input_format="rank_values",
             )
             module.scores.copy_(
@@ -591,7 +454,7 @@ def _aggregate_rank_round(
                 )
             )
             summaries[name] = result
-    if config.attack == "vem" and config.vem_source_compatible:
+    if config.attack == "vem":
         for name, module in scored_modules(model).items():
             vem_state["global_orders"][name] = _vem_source_edge_order(
                 module.scores.detach()
@@ -654,9 +517,7 @@ def _aggregate_gradient_round(
         aggregate, diagnostics = bcpbfl(updates, root, config.bcp_server_lr)
         del root
     elif config.method == "rvpfl":
-        aggregate, diagnostics = rvpfl(
-            updates, config.rvpfl_paper_extra_division
-        )
+        aggregate, diagnostics = rvpfl(updates)
     else:
         raise ValueError(config.method)
     _apply_gradient_update(model, aggregate)
@@ -693,18 +554,13 @@ def evaluate(
         loss_sum += float(criterion(logits, labels))
         correct += int((logits.argmax(dim=1) == labels).sum())
         total += labels.numel()
-        if config.attack in ("pixel_backdoor", "pixel_backdoor_low_data"):
+        if config.attack == "pixel_backdoor":
             eligible = labels != config.backdoor_target
             if bool(eligible.any()):
                 triggered = stamp_trigger(
                     images[eligible],
                     config.dataset,
                     config.trigger_size,
-                    pattern=(
-                        "paper-f"
-                        if config.attack == "pixel_backdoor_low_data"
-                        else "square"
-                    ),
                 )
                 predictions = model(triggered).argmax(dim=1)
                 attack_success += int(
@@ -721,11 +577,6 @@ METRIC_COLUMNS = (
     "test_loss",
     "backdoor_asr",
     "best_acc",
-    "val_acc",
-    "val_loss",
-    "hybrid_phase",
-    "hybrid_switch",
-    "hybrid_best_round",
     "malicious_clients",
     "accepted",
     "rejected",
@@ -774,88 +625,6 @@ def _truncate_metrics(path: Path, completed_rounds: int) -> None:
     os.replace(temporary, path)
 
 
-def _capture_hybrid_snapshot(
-    model: nn.Module,
-    vem_state: Mapping[str, Mapping[str, torch.Tensor]],
-    round_number: int,
-) -> Dict[str, object]:
-    return {
-        "round": int(round_number),
-        "model": {
-            name: tensor.detach().cpu().clone()
-            for name, tensor in model.state_dict().items()
-        },
-        "vem_state": {
-            group: {
-                name: tensor.detach().cpu().clone()
-                for name, tensor in layers.items()
-            }
-            for group, layers in vem_state.items()
-        },
-    }
-
-
-def _restore_hybrid_snapshot(
-    snapshot: Mapping[str, object],
-    model: nn.Module,
-    vem_state: MutableMapping[str, Dict[str, torch.Tensor]],
-) -> None:
-    device = next(model.parameters()).device
-    model_state = snapshot.get("model")
-    stored_vem = snapshot.get("vem_state")
-    if not isinstance(model_state, Mapping) or not isinstance(
-        stored_vem, Mapping
-    ):
-        raise ValueError("invalid hybrid rollback snapshot")
-    model.load_state_dict(
-        {
-            str(name): tensor.to(device)
-            for name, tensor in model_state.items()
-        }
-    )
-    restored_vem: Dict[str, Dict[str, torch.Tensor]] = {}
-    for group, layers in stored_vem.items():
-        if not isinstance(layers, Mapping):
-            raise ValueError("invalid hybrid VEM rollback state")
-        restored_vem[str(group)] = {
-            str(name): tensor.to(device)
-            for name, tensor in layers.items()
-        }
-    vem_state.clear()
-    vem_state.update(restored_vem)
-
-
-def _hybrid_rankings_from_model(
-    model: nn.Module,
-) -> Dict[str, torch.Tensor]:
-    return {
-        name: _rank_values(module.scores.detach()).long()
-        for name, module in scored_modules(model).items()
-    }
-
-
-def _hybrid_triggered(
-    mode: str,
-    completed_round: int,
-    warmup_rounds: int,
-    window_ready: bool,
-    signal: float,
-    best_signal: float,
-    drop: float,
-    bad_streak: int,
-    patience: int,
-) -> bool:
-    if mode == "fixed":
-        return completed_round >= warmup_rounds
-    return (
-        mode == "adaptive"
-        and completed_round >= warmup_rounds
-        and window_ready
-        and best_signal - signal >= drop
-        and bad_streak >= patience
-    )
-
-
 def _save_checkpoint(
     path: Path,
     model: nn.Module,
@@ -864,7 +633,6 @@ def _save_checkpoint(
     elapsed_seconds: float,
     cmgra: CMGRAAggregator | None,
     vem_state: Mapping[str, Mapping[str, torch.Tensor]],
-    hybrid_state: Mapping[str, object] | None = None,
 ) -> None:
     temporary = path.with_suffix(".tmp")
     torch.save(
@@ -881,7 +649,6 @@ def _save_checkpoint(
                 }
                 for group, layers in vem_state.items()
             },
-            "hybrid_state": copy.deepcopy(hybrid_state),
         },
         temporary,
     )
@@ -901,12 +668,6 @@ def run(config: RunConfig) -> Path:
         raise ValueError("clean runs must use malicious_fraction=0")
     if config.attack != "clean" and not 0 < config.malicious_fraction < 0.5:
         raise ValueError("attacked runs require malicious_fraction in (0, 0.5)")
-    hybrid_enabled = config.cmgra_hybrid_mode != "none"
-    if hybrid_enabled and config.method != "cmgra-px":
-        raise ValueError("CMGRA hybrid modes require method='cmgra-px'")
-    if hybrid_enabled and config.root_size <= 0:
-        raise ValueError("CMGRA hybrid modes require a non-empty root set")
-
     output = run_directory(config)
     output.mkdir(parents=True, exist_ok=True)
     config_path = output / "config.json"
@@ -922,40 +683,12 @@ def run(config: RunConfig) -> Path:
             for key, value in previous.items()
             if key in config_payload or key == "rounds"
         }
-        # A short-lived manifest revision omitted this now-inactive
-        # compatibility field. Normalize both old checkpoint variants.
-        previous.setdefault("shuffle_scale", 10000.0)
-        previous.setdefault("label_flip_target", 0)
-        previous.setdefault("vem_source_compatible", True)
         previous.setdefault("local_cosine", False)
-        previous.setdefault("global_cosine_start", -1)
-        previous.setdefault("global_min_lr", 0.02)
         previous.setdefault("data_partition", "iid")
         previous.setdefault("partition_file", "")
         previous.setdefault("model", "auto")
         previous.setdefault("rank_weight_init", "signed-constant")
-        previous.setdefault("svhn_batchnorm", False)
-        previous.setdefault("cmgra_preserve_order", False)
-        previous.setdefault("cmgra_membership_order", False)
-        previous.setdefault("cmgra_borda_order", False)
-        previous.setdefault("cmgra_borda_final_order", False)
-        previous.setdefault("cmgra_pair_matching", "extreme")
-        previous.setdefault("cmgra_count_ema", 0.0)
-        previous.setdefault("cmgra_swap_cap", 0)
-        previous.setdefault("cmgra_persistence_rounds", 1)
-        previous.setdefault("cmgra_update_interval", 1)
-        previous.setdefault("cmgra_borda_mode", "sum")
-        previous.setdefault("cmgra_rank_buckets", 0)
-        previous.setdefault("cmgra_borda_ema", 0.0)
-        previous.setdefault("cmgra_prior_rank_weight", 0.0)
-        previous.setdefault("cmgra_hybrid_mode", "none")
-        previous.setdefault("cmgra_hybrid_warmup_rounds", 20)
-        previous.setdefault("cmgra_hybrid_val_window", 5)
-        previous.setdefault("cmgra_hybrid_val_drop", 0.015)
-        previous.setdefault("cmgra_hybrid_patience", 5)
-        # Ignore retired fields written by the former multi-method and
-        # FEMNIST benchmark.  They never affected FRL/CMGRA-PX updates.
-        previous.setdefault("rvpfl_paper_extra_division", False)
+        previous.setdefault("conv_batchnorm", False)
         previous_rounds = int(previous.pop("rounds", config.rounds))
         current_without_rounds = dict(config_payload)
         current_rounds = int(current_without_rounds.pop("rounds"))
@@ -981,7 +714,7 @@ def run(config: RunConfig) -> Path:
         rank_based,
         keep_ratio=config.keep_ratio,
         rank_weight_init=config.rank_weight_init,
-        svhn_batchnorm=config.svhn_batchnorm,
+        conv_batchnorm=config.conv_batchnorm,
         model_name=config.model,
     ).to(device)
     parameter_count = communicated_parameter_count(model, rank_based)
@@ -991,33 +724,14 @@ def run(config: RunConfig) -> Path:
         "global_orders": {},
         "malicious_rankings": {},
     }
-    if config.method == "cmgra-px":
+    if config.method == "cmgra":
         cmgra = CMGRAAggregator(
             retention_ratio=config.keep_ratio,
             max_malicious=0,
             public_seed=config.cmgra_seed,
             invalid_policy="raise",
-            pairwise_fallback=config.cmgra_pairwise,
-            pairwise_matching=config.cmgra_pair_matching,
-            aggregation_variant="cmgra-px",
-            preserve_group_order=config.cmgra_preserve_order,
-            membership_group_order=config.cmgra_membership_order,
-            borda_group_order=config.cmgra_borda_order,
-            borda_final_order=config.cmgra_borda_final_order,
-            count_ema=config.cmgra_count_ema,
-            swap_cap=(
-                config.cmgra_swap_cap
-                if config.cmgra_swap_cap > 0
-                else None
-            ),
-            persistence_rounds=config.cmgra_persistence_rounds,
-            update_interval=config.cmgra_update_interval,
-            borda_mode=config.cmgra_borda_mode,
-            rank_buckets=config.cmgra_rank_buckets,
-            borda_ema=config.cmgra_borda_ema,
-            prior_rank_weight=config.cmgra_prior_rank_weight,
         )
-        # Under the zero-threat clean protocol, CMGRA-PX deliberately reduces
+        # Under the zero-threat clean protocol, CMGRA deliberately reduces
         # to FRL.  Keep FRL's original public score initialization as well as
         # its Borda update so the two clean trajectories are directly paired.
         if config.attack != "clean":
@@ -1031,7 +745,6 @@ def run(config: RunConfig) -> Path:
         config.root_size,
         partition=config.data_partition,
         partition_file=config.partition_file or None,
-        disjoint_root=hybrid_enabled,
     )
     evaluation_loader = test_loader(
         data, config.test_batch_size, config.num_workers
@@ -1044,31 +757,12 @@ def run(config: RunConfig) -> Path:
             config.backdoor_examples,
             config.trigger_size,
         )
-        if config.attack == "pixel_backdoor_low_data"
-        else None
-    )
-    heldout_loader = (
-        validation_loader(
-            data, config.test_batch_size, config.num_workers
-        )
-        if hybrid_enabled
+        if config.attack == "pixel_backdoor"
         else None
     )
     start_round = 0
     best_acc = 0.0
     elapsed_before = 0.0
-    hybrid_state: Dict[str, object] | None = (
-        {
-            "phase": "frl",
-            "val_history": [],
-            "best_signal": float("-inf"),
-            "best_round": 0,
-            "bad_streak": 0,
-            "best_snapshot": None,
-        }
-        if hybrid_enabled
-        else None
-    )
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
@@ -1086,21 +780,10 @@ def run(config: RunConfig) -> Path:
                 }
                 for group, layers in stored_vem_state.items()
             }
-        elif (
-            config.attack == "vem"
-            and config.vem_source_compatible
-            and start_round > 0
-        ):
+        elif config.attack == "vem" and start_round > 0:
             raise RuntimeError(
                 "source-compatible VEM checkpoint is missing attack history"
             )
-        if hybrid_enabled:
-            stored_hybrid = checkpoint.get("hybrid_state")
-            if not isinstance(stored_hybrid, Mapping):
-                raise RuntimeError(
-                    "hybrid checkpoint is missing switching state"
-                )
-            hybrid_state = copy.deepcopy(dict(stored_hybrid))
         logged = _last_logged_round(metrics_path)
         if logged > start_round:
             # A process may stop after writing metrics but before the next
@@ -1168,12 +851,6 @@ def run(config: RunConfig) -> Path:
                 update = _model_delta(local, model)
                 if reverse_delta:
                     update = [-tensor for tensor in update]
-                if malicious and config.attack == "gaussian_noise":
-                    update = _add_gaussian_noise(
-                        update,
-                        config.noise_scale,
-                        _stable_seed("gradient-noise", config.seed, round_index, client_id),
-                    )
                 updates.append(update)
                 del local
             diagnostics = _aggregate_gradient_round(
@@ -1183,11 +860,7 @@ def run(config: RunConfig) -> Path:
         else:
             uploads = []
             malicious_rows = []
-            if (
-                config.attack == "vem"
-                and config.vem_source_compatible
-                and malicious_ids
-            ):
+            if config.attack == "vem" and malicious_ids:
                 # VEM-master does not train the selected malicious identities
                 # to estimate r_s.  It samples the same number of source
                 # clients from [0, int(nClients * at_fractions)) and uses
@@ -1266,85 +939,8 @@ def run(config: RunConfig) -> Path:
                 round_index,
                 cmgra,
                 vem_state,
-                force_frl=(
-                    hybrid_state is not None
-                    and hybrid_state["phase"] == "frl"
-                ),
             )
             del uploads
-
-        val_acc = float("nan")
-        val_loss = float("nan")
-        hybrid_switch = ""
-        if hybrid_state is not None:
-            if heldout_loader is None or cmgra is None:
-                raise RuntimeError("hybrid validation state is missing")
-            val_acc, val_loss, _ = evaluate(
-                model, heldout_loader, config
-            )
-            history = hybrid_state["val_history"]
-            if not isinstance(history, list):
-                raise RuntimeError("invalid hybrid validation history")
-            history.append(float(val_acc))
-
-            if hybrid_state["phase"] == "frl":
-                window = config.cmgra_hybrid_val_window
-                window_ready = len(history) >= window
-                signal_values = history[-window:] if window_ready else history
-                signal = sum(signal_values) / len(signal_values)
-                best_signal = float(hybrid_state["best_signal"])
-                if signal > best_signal:
-                    hybrid_state["best_signal"] = signal
-                    hybrid_state["best_round"] = round_index + 1
-                    hybrid_state["bad_streak"] = 0
-                    hybrid_state["best_snapshot"] = (
-                        _capture_hybrid_snapshot(
-                            model, vem_state, round_index + 1
-                        )
-                    )
-                elif (
-                    best_signal - signal
-                    >= config.cmgra_hybrid_val_drop
-                ):
-                    hybrid_state["bad_streak"] = (
-                        int(hybrid_state["bad_streak"]) + 1
-                    )
-                else:
-                    hybrid_state["bad_streak"] = 0
-
-                if _hybrid_triggered(
-                    config.cmgra_hybrid_mode,
-                    round_index + 1,
-                    config.cmgra_hybrid_warmup_rounds,
-                    window_ready,
-                    signal,
-                    float(hybrid_state["best_signal"]),
-                    config.cmgra_hybrid_val_drop,
-                    int(hybrid_state["bad_streak"]),
-                    config.cmgra_hybrid_patience,
-                ):
-                    snapshot = hybrid_state.get("best_snapshot")
-                    if not isinstance(snapshot, Mapping):
-                        raise RuntimeError(
-                            "hybrid trigger has no rollback snapshot"
-                        )
-                    rollback_round = int(snapshot["round"])
-                    _restore_hybrid_snapshot(
-                        snapshot, model, vem_state
-                    )
-                    cmgra.adopt_global_rankings(
-                        _hybrid_rankings_from_model(model)
-                    )
-                    hybrid_state["phase"] = "cmgra"
-                    hybrid_switch = (
-                        f"{config.cmgra_hybrid_mode}:"
-                        f"rollback={rollback_round}"
-                    )
-                    # Log validation for the state actually sent to the next
-                    # communication round, not the discarded trigger state.
-                    val_acc, val_loss, _ = evaluate(
-                        model, heldout_loader, config
-                    )
 
         test_acc, test_loss, asr = evaluate(
             model, evaluation_loader, config
@@ -1360,21 +956,6 @@ def run(config: RunConfig) -> Path:
                 f"{asr:.8f}" if not math.isnan(asr) else ""
             ),
             "best_acc": f"{best_acc:.8f}",
-            "val_acc": (
-                f"{val_acc:.8f}" if not math.isnan(val_acc) else ""
-            ),
-            "val_loss": (
-                f"{val_loss:.8f}" if not math.isnan(val_loss) else ""
-            ),
-            "hybrid_phase": (
-                hybrid_state["phase"] if hybrid_state is not None else ""
-            ),
-            "hybrid_switch": hybrid_switch,
-            "hybrid_best_round": (
-                hybrid_state["best_round"]
-                if hybrid_state is not None
-                else ""
-            ),
             "malicious_clients": len(malicious_ids),
             "round_seconds": f"{round_seconds:.3f}",
             "elapsed_seconds": f"{elapsed:.3f}",
@@ -1394,7 +975,6 @@ def run(config: RunConfig) -> Path:
                 elapsed,
                 cmgra,
                 vem_state,
-                hybrid_state,
             )
         torch.cuda.empty_cache()
     return output
@@ -1436,18 +1016,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfig:
     parser.add_argument("--dataset", choices=DATASETS, required=True)
     parser.add_argument(
         "--model",
-        choices=(
-            "auto",
-            "conv2",
-            "lenet",
-            "lenet-wide-160",
-            "conv4",
-            "conv8",
-            "resnet18",
-            "resnet34",
-            "wideresnet28x6",
-            "wideresnet28x10",
-        ),
+        choices=("auto", "conv2", "conv8", "resnet18"),
         default="auto",
     )
     parser.add_argument("--method", choices=ALL_METHODS, required=True)
@@ -1473,21 +1042,6 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfig:
     parser.add_argument("--test-batch-size", type=int)
     parser.add_argument("--local-lr", type=float)
     parser.add_argument("--lr-decay", type=float, default=0.999)
-    parser.add_argument(
-        "--global-cosine-start",
-        type=int,
-        default=-1,
-        help=(
-            "communication round at which the global base LR switches from "
-            "exponential decay to cosine decay; -1 disables it"
-        ),
-    )
-    parser.add_argument(
-        "--global-min-lr",
-        type=float,
-        default=0.02,
-        help="final base LR used by global cosine decay",
-    )
     parser.add_argument("--momentum", type=float)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     cosine = parser.add_mutually_exclusive_group()
@@ -1506,155 +1060,33 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfig:
         help="fixed-weight initialization used by rank-based models",
     )
     parser.add_argument(
-        "--svhn-batchnorm",
         "--conv-batchnorm",
-        dest="svhn_batchnorm",
+        dest="conv_batchnorm",
         action="store_true",
-        help="insert non-affine, stateless BatchNorm layers into Conv4/Conv8",
+        help="insert non-affine, stateless BatchNorm layers into Conv8",
     )
     parser.add_argument("--bcp-server-lr", type=float, default=0.1)
-    parser.add_argument("--root-size", type=int, default=200)
-    parser.add_argument("--noise-scale", type=float, default=1.0)
-    parser.add_argument("--label-flip-target", type=int, default=0)
-    parser.add_argument(
-        "--shuffle-scale",
-        type=float,
-        default=10000.0,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument("--backdoor-fraction", type=float, default=0.2)
-    parser.add_argument("--backdoor-target", type=int, default=7)
+    parser.add_argument("--root-size", type=int, default=0)
+    parser.add_argument("--backdoor-target", type=int, default=2)
     parser.add_argument("--trigger-size", type=int, default=5)
     parser.add_argument("--backdoor-examples", type=int, default=9)
     parser.add_argument("--cmgra-seed", type=int)
-    parser.add_argument("--no-cmgra-pairwise", action="store_true")
-    parser.add_argument(
-        "--cmgra-pair-matching",
-        choices=("extreme", "max-cardinality"),
-        default="extreme",
-        help=(
-            "certified pair construction: strongest challenger versus weakest "
-            "incumbent, or maximum-cardinality threshold matching"
-        ),
-    )
-    group_order = parser.add_mutually_exclusive_group()
-    group_order.add_argument("--cmgra-preserve-order", action="store_true")
-    group_order.add_argument("--cmgra-membership-order", action="store_true")
-    group_order.add_argument("--cmgra-borda-order", action="store_true")
-    group_order.add_argument(
-        "--cmgra-borda-final-order",
-        action="store_true",
-    )
-    parser.add_argument("--cmgra-count-ema", type=float, default=0.0)
-    parser.add_argument(
-        "--cmgra-swap-cap",
-        type=int,
-        default=0,
-        help="maximum certified pair swaps per layer and round; 0 is unlimited",
-    )
-    parser.add_argument(
-        "--cmgra-persistence-rounds", type=int, default=1
-    )
-    parser.add_argument("--cmgra-update-interval", type=int, default=1)
-    parser.add_argument(
-        "--cmgra-borda-mode",
-        choices=("sum", "lower-bound"),
-        default="sum",
-        help=(
-            "within-group score computed from aggregate s and c only; "
-            "certificates remain count-only"
-        ),
-    )
-    parser.add_argument(
-        "--cmgra-rank-buckets",
-        type=int,
-        default=0,
-        help=(
-            "quantize client ranks into Q fixed-cardinality buckets and use "
-            "m*(Q-1)-certified within-group compare-swaps; 0 disables"
-        ),
-    )
-    parser.add_argument(
-        "--cmgra-borda-ema",
-        type=float,
-        default=0.0,
-        help=(
-            "EMA coefficient for normalized aggregate Borda used only for "
-            "within-group ordering"
-        ),
-    )
-    parser.add_argument(
-        "--cmgra-prior-rank-weight",
-        type=float,
-        default=0.0,
-        help=(
-            "weight of the previous normalized global ranking in temporal "
-            "within-group Borda ordering"
-        ),
-    )
-    parser.add_argument(
-        "--cmgra-hybrid-mode",
-        choices=("none", "fixed", "adaptive"),
-        default="none",
-        help=(
-            "use FRL during a held-out-data warm-up, then switch once to "
-            "CMGRA-PX either at a fixed round or after a persistent "
-            "validation decline"
-        ),
-    )
-    parser.add_argument(
-        "--cmgra-hybrid-warmup-rounds", type=int, default=20
-    )
-    parser.add_argument(
-        "--cmgra-hybrid-val-window", type=int, default=5
-    )
-    parser.add_argument(
-        "--cmgra-hybrid-val-drop", type=float, default=0.015
-    )
-    parser.add_argument(
-        "--cmgra-hybrid-patience", type=int, default=5
-    )
     parser.add_argument("--vem-lr", type=float, default=0.1)
     parser.add_argument("--vem-epochs", type=int, default=50)
     parser.add_argument("--vem-max-window", type=int, default=2500)
     parser.add_argument("--vem-temperature", type=float, default=0.0001)
     parser.add_argument("--vem-sinkhorn-iterations", type=int, default=50)
     parser.add_argument("--vem-noise", type=float, default=1.0)
-    parser.add_argument(
-        "--no-vem-source-compatible",
-        action="store_true",
-        help="disable the published VEM history and server-visible permutation path",
-    )
-    parser.add_argument("--rvpfl-paper-extra-division", action="store_true")
     parser.add_argument("--checkpoint-interval", type=int, default=10)
     parser.add_argument("--data-root", default="benchmark_data")
     parser.add_argument("--output-root", default="BenchmarkRuns")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     values = parser.parse_args(argv)
-    if values.global_cosine_start < -1:
-        parser.error("--global-cosine-start must be -1 or non-negative")
-    if values.global_cosine_start >= values.rounds:
-        parser.error("--global-cosine-start must be smaller than --rounds")
-    if values.global_min_lr < 0:
-        parser.error("--global-min-lr must be non-negative")
-    if not 0 <= values.label_flip_target < 10:
-        parser.error("--label-flip-target must be in [0, 9]")
-    if values.cmgra_hybrid_warmup_rounds < 1:
-        parser.error("--cmgra-hybrid-warmup-rounds must be positive")
-    if (
-        values.cmgra_hybrid_mode != "none"
-        and values.cmgra_hybrid_warmup_rounds >= values.rounds
-    ):
+    if values.model != "auto" and values.model != MODEL_FOR_DATASET[values.dataset]:
         parser.error(
-            "--cmgra-hybrid-warmup-rounds must be smaller than --rounds"
+            f"{values.dataset} is paired with {MODEL_FOR_DATASET[values.dataset]}"
         )
-    if values.cmgra_hybrid_val_window < 1:
-        parser.error("--cmgra-hybrid-val-window must be positive")
-    if values.cmgra_hybrid_val_drop < 0:
-        parser.error("--cmgra-hybrid-val-drop must be non-negative")
-    if values.cmgra_hybrid_patience < 1:
-        parser.error("--cmgra-hybrid-patience must be positive")
     if values.data_partition == "legacy-vem" and not values.partition_file:
         parser.error(
             "--partition-file is required with --data-partition legacy-vem"
@@ -1679,13 +1111,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfig:
         values.local_cosine
         if values.local_cosine is not None
         else family == "rank"
-        and (
-            values.dataset in MNIST_LIKE_DATASETS
-            or (
-                values.attack == "vem"
-                and not values.no_vem_source_compatible
-            )
-        )
+        and (values.dataset in MNIST_LIKE_DATASETS or values.attack == "vem")
     )
     n_clients = (
         values.n_clients
@@ -1720,53 +1146,24 @@ def parse_args(argv: Sequence[str] | None = None) -> RunConfig:
         test_batch_size=test_batch_size,
         local_lr=local_lr,
         lr_decay=values.lr_decay,
-        global_cosine_start=values.global_cosine_start,
-        global_min_lr=values.global_min_lr,
         momentum=momentum,
         weight_decay=values.weight_decay,
         local_cosine=local_cosine,
         keep_ratio=keep_ratio,
         rank_weight_init=values.rank_weight_init,
-        svhn_batchnorm=values.svhn_batchnorm,
+        conv_batchnorm=values.conv_batchnorm,
         bcp_server_lr=values.bcp_server_lr,
         root_size=values.root_size,
-        noise_scale=values.noise_scale,
-        shuffle_scale=values.shuffle_scale,
-        label_flip_target=values.label_flip_target,
-        backdoor_fraction=values.backdoor_fraction,
         backdoor_target=values.backdoor_target,
         trigger_size=values.trigger_size,
         backdoor_examples=values.backdoor_examples,
         cmgra_seed=cmgra_seed,
-        cmgra_pairwise=not values.no_cmgra_pairwise,
-        cmgra_pair_matching=values.cmgra_pair_matching,
-        cmgra_preserve_order=values.cmgra_preserve_order,
-        cmgra_membership_order=values.cmgra_membership_order,
-        cmgra_borda_order=values.cmgra_borda_order,
-        cmgra_borda_final_order=values.cmgra_borda_final_order,
-        cmgra_count_ema=values.cmgra_count_ema,
-        cmgra_swap_cap=values.cmgra_swap_cap,
-        cmgra_persistence_rounds=values.cmgra_persistence_rounds,
-        cmgra_update_interval=values.cmgra_update_interval,
-        cmgra_borda_mode=values.cmgra_borda_mode,
-        cmgra_rank_buckets=values.cmgra_rank_buckets,
-        cmgra_borda_ema=values.cmgra_borda_ema,
-        cmgra_prior_rank_weight=values.cmgra_prior_rank_weight,
-        cmgra_hybrid_mode=values.cmgra_hybrid_mode,
-        cmgra_hybrid_warmup_rounds=(
-            values.cmgra_hybrid_warmup_rounds
-        ),
-        cmgra_hybrid_val_window=values.cmgra_hybrid_val_window,
-        cmgra_hybrid_val_drop=values.cmgra_hybrid_val_drop,
-        cmgra_hybrid_patience=values.cmgra_hybrid_patience,
         vem_lr=values.vem_lr,
         vem_epochs=values.vem_epochs,
         vem_max_window=values.vem_max_window,
         vem_temperature=values.vem_temperature,
         vem_sinkhorn_iterations=values.vem_sinkhorn_iterations,
         vem_noise=values.vem_noise,
-        vem_source_compatible=not values.no_vem_source_compatible,
-        rvpfl_paper_extra_division=values.rvpfl_paper_extra_division,
         checkpoint_interval=values.checkpoint_interval,
         data_root=values.data_root,
         output_root=values.output_root,

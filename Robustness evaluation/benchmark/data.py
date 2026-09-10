@@ -87,61 +87,6 @@ def _balanced_root_indices(
     return np.sort(np.concatenate(selected).astype(np.int64))
 
 
-def _disjoint_balanced_root_partition(
-    targets: np.ndarray,
-    client_indices: Sequence[np.ndarray],
-    size: int,
-    seed: int,
-) -> tuple[np.ndarray, List[np.ndarray]]:
-    """Hold out a class-balanced server set without emptying any client.
-
-    One deterministic example from every non-empty client is protected before
-    sampling the server set.  The selected server examples are then removed
-    from all client partitions, so validation labels cannot leak through local
-    training.
-    """
-
-    if size <= 0:
-        return np.empty(0, dtype=np.int64), [
-            np.asarray(indices, dtype=np.int64).copy()
-            for indices in client_indices
-        ]
-    classes = np.unique(targets)
-    if size % len(classes):
-        raise ValueError("root_size must be divisible by the number of classes")
-
-    protected = np.zeros(targets.shape[0], dtype=bool)
-    for indices in client_indices:
-        values = np.asarray(indices, dtype=np.int64)
-        if values.size == 0:
-            raise ValueError("client partition must not be empty")
-        protected[int(values[0])] = True
-
-    per_class = size // len(classes)
-    rng = np.random.default_rng(seed + 2909)
-    selected = []
-    for label in classes:
-        candidates = np.flatnonzero((targets == label) & ~protected)
-        if candidates.size < per_class:
-            raise ValueError(
-                f"not enough class-{int(label)} examples for a disjoint "
-                f"root set of size {size}"
-            )
-        selected.append(rng.choice(candidates, per_class, replace=False))
-    root_indices = np.sort(np.concatenate(selected).astype(np.int64))
-
-    held_out = np.zeros(targets.shape[0], dtype=bool)
-    held_out[root_indices] = True
-    stripped = []
-    for indices in client_indices:
-        values = np.asarray(indices, dtype=np.int64)
-        remaining = values[~held_out[values]]
-        if remaining.size == 0:
-            raise RuntimeError("disjoint root selection emptied a client")
-        stripped.append(remaining.astype(np.int64, copy=False))
-    return root_indices, stripped
-
-
 def _iid_partition(size: int, n_clients: int, seed: int) -> List[np.ndarray]:
     rng = np.random.default_rng(seed + 8101)
     shuffled = rng.permutation(size)
@@ -198,7 +143,6 @@ def load_federated_data(
     download: bool = True,
     partition: str = "iid",
     partition_file: str | None = None,
-    disjoint_root: bool = False,
 ) -> FederatedData:
     dataset = dataset.lower()
     mean, std = DATASET_STATS[dataset]
@@ -281,14 +225,7 @@ def load_federated_data(
     else:
         raise ValueError(f"unknown client partition: {partition}")
 
-    if disjoint_root:
-        root_indices, client_indices = _disjoint_balanced_root_partition(
-            targets, client_indices, root_size, partition_seed
-        )
-    else:
-        root_indices = _balanced_root_indices(
-            targets, root_size, partition_seed
-        )
+    root_indices = _balanced_root_indices(targets, root_size, partition_seed)
 
     return FederatedData(
         train=train,
@@ -345,23 +282,6 @@ def root_loader(
     )
 
 
-def validation_loader(
-    data: FederatedData,
-    batch_size: int,
-    num_workers: int = 0,
-) -> DataLoader:
-    """Return the deterministic, non-augmented held-out server loader."""
-
-    dataset = data.train_eval if data.train_eval is not None else data.train
-    return DataLoader(
-        Subset(dataset, data.root_indices.tolist()),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-
-
 def test_loader(
     data: FederatedData, batch_size: int, num_workers: int = 0
 ) -> DataLoader:
@@ -378,14 +298,8 @@ def stamp_trigger(
     images: torch.Tensor,
     dataset: str,
     trigger_size: int = 3,
-    pattern: str = "square",
 ) -> torch.Tensor:
-    """Stamp a white trigger on already normalized tensors.
-
-    ``paper-f`` is the small, top-left F-shaped artificial trigger shown in
-    Appendix C of the FRL paper.  ``square`` preserves the benchmark's
-    existing bottom-right patch attack.
-    """
+    """Stamp the paper's top-left white F trigger on normalized tensors."""
 
     images = images.clone()
     mean, std = DATASET_STATS[dataset.lower()]
@@ -394,17 +308,12 @@ def stamp_trigger(
         device=images.device,
         dtype=images.dtype,
     ).reshape(1, -1, 1, 1)
-    if pattern == "square":
-        images[:, :, -trigger_size:, -trigger_size:] = white
-    elif pattern == "paper-f":
-        height = min(trigger_size, images.shape[-2])
-        width = min(max(2, trigger_size // 2 + 1), images.shape[-1])
-        images[:, :, :height, :1] = white
-        images[:, :, :1, :width] = white
-        middle = min(height // 2, height - 1)
-        images[:, :, middle : middle + 1, :width] = white
-    else:
-        raise ValueError(f"unknown trigger pattern: {pattern}")
+    height = min(trigger_size, images.shape[-2])
+    width = min(max(2, trigger_size // 2 + 1), images.shape[-1])
+    images[:, :, :height, :1] = white
+    images[:, :, :1, :width] = white
+    middle = min(height // 2, height - 1)
+    images[:, :, middle : middle + 1, :width] = white
     return images
 
 
@@ -430,7 +339,5 @@ def fixed_paper_backdoor_dataset(
     if candidates.size < examples:
         raise ValueError("not enough non-target examples for poison bank")
     images = torch.stack([source[int(index)][0] for index in candidates[:examples]])
-    poisoned = stamp_trigger(
-        images, dataset, trigger_size, pattern="paper-f"
-    )
+    poisoned = stamp_trigger(images, dataset, trigger_size)
     return FixedBackdoorDataset(poisoned, target)

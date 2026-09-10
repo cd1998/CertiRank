@@ -1,23 +1,20 @@
-"""Focused regression tests for the three-dataset FRL/CMGRA-PX benchmark."""
+"""Focused regression tests for the three-dataset FRL/CMGRA benchmark."""
 
 import unittest
 
 import numpy as np
 import torch
 
-from benchmark import ALL_METHODS, DATASETS, RANK_METHODS, attack_applies, method_family
+from benchmark import (
+    ALL_METHODS,
+    DATASETS,
+    COMMON_ATTACKS,
+    RANK_METHODS,
+    attack_applies,
+    method_family,
+)
 from benchmark.aggregators import bcpbfl, fedavg, rvpfl
-from benchmark.manifest import build_tasks
-from benchmark.finite_grad_ascent_campaign import (
-    build_tasks as build_finite_gradient_ascent_tasks,
-    validate_tasks as validate_finite_gradient_ascent_tasks,
-)
-from benchmark.supplement_campaign import build_tasks as build_supplement_tasks
-from benchmark.supplement_campaign import validate_tasks
-from benchmark.paper_backdoor_campaign import (
-    build_tasks as build_paper_backdoor_tasks,
-    validate_tasks as validate_paper_backdoor_tasks,
-)
+from benchmark.manifest import build_tasks, validate_tasks
 from benchmark.data import FixedBackdoorDataset, stamp_trigger
 from benchmark.models import build_model, communicated_parameter_count
 from benchmark.runner import (
@@ -34,19 +31,19 @@ class RegistryTests(unittest.TestCase):
     def test_only_requested_datasets_and_methods_are_exposed(self):
         self.assertEqual(DATASETS, ("mnist", "svhn", "cifar10"))
         self.assertEqual(
-            ALL_METHODS, ("fedavg", "bcpbfl", "rvpfl", "frl", "cmgra-px")
+            ALL_METHODS, ("fedavg", "bcpbfl", "rvpfl", "frl", "cmgra")
         )
         for method in ("fedavg", "bcpbfl", "rvpfl"):
             self.assertEqual(method_family(method), "gradient")
         self.assertEqual(method_family("frl"), "rank")
-        self.assertEqual(method_family("cmgra-px"), "rank")
+        self.assertEqual(method_family("cmgra"), "rank")
 
     def test_rank_attacks_apply_to_both_methods(self):
         for method in ALL_METHODS:
             self.assertTrue(attack_applies(method, "clean"))
             self.assertTrue(attack_applies(method, "label_flip"))
-            self.assertTrue(attack_applies(method, "label_flip_all_to_one"))
-            self.assertTrue(attack_applies(method, "pixel_backdoor_low_data"))
+            self.assertTrue(attack_applies(method, "grad_ascent"))
+            self.assertTrue(attack_applies(method, "pixel_backdoor"))
         for method in RANK_METHODS:
             self.assertTrue(attack_applies(method, "vem"))
         for method in ("fedavg", "bcpbfl", "rvpfl"):
@@ -54,48 +51,29 @@ class RegistryTests(unittest.TestCase):
 
     def test_manifest_contains_no_retired_dataset_or_method(self):
         tasks = build_tasks(rounds=3, seed=7)
+        validate_tasks(tasks)
         self.assertTrue(tasks)
+        self.assertEqual(len(tasks), 168)
         self.assertEqual({task["dataset"] for task in tasks}, set(DATASETS))
         self.assertEqual({task["method"] for task in tasks}, set(ALL_METHODS))
-
-    def test_supplement_campaign_is_complete_and_unique(self):
-        tasks = build_supplement_tasks(rounds=500, seed=0)
-        validate_tasks(tasks)
-        self.assertEqual(len(tasks), 246)
-        vem = [task for task in tasks if task["attack"] == "vem"]
-        common = [task for task in tasks if task["attack"] != "vem"]
-        self.assertEqual(len(vem), 6)
-        self.assertEqual(len(common), 240)
         self.assertEqual(
-            {task["malicious_fraction"] for task in vem}, {0.1, 0.3, 0.4}
+            {task["malicious_fraction"] for task in tasks if task["attack"] != "clean"},
+            {0.1, 0.2, 0.3},
         )
-
-    def test_paper_backdoor_campaign_is_complete_and_explicit(self):
-        tasks = build_paper_backdoor_tasks(rounds=500, seed=0)
-        validate_paper_backdoor_tasks(tasks)
-        self.assertEqual(len(tasks), 60)
+        self.assertEqual(
+            {task["attack"] for task in tasks},
+            {"clean", *COMMON_ATTACKS, "vem"},
+        )
         for task in tasks:
             config = parse_args(task["arguments"])
+            self.assertEqual(config.n_clients, 1000)
+            self.assertEqual(config.round_clients, 25)
             self.assertEqual(config.backdoor_target, 2)
             self.assertEqual(config.backdoor_examples, 9)
 
-    def test_finite_gradient_ascent_campaign_is_complete(self):
-        tasks = build_finite_gradient_ascent_tasks(rounds=500, seed=0)
-        validate_finite_gradient_ascent_tasks(tasks)
-        self.assertEqual(len(tasks), 9)
-        self.assertEqual({task["dataset"] for task in tasks}, {"svhn"})
-        self.assertEqual(
-            {task["method"] for task in tasks},
-            {"fedavg", "bcpbfl", "rvpfl"},
-        )
-        self.assertEqual(
-            {task["malicious_fraction"] for task in tasks},
-            {0.1, 0.2, 0.3},
-        )
-
     def test_paper_f_trigger_is_top_left(self):
         images = torch.zeros(1, 1, 28, 28)
-        stamped = stamp_trigger(images, "mnist", 5, pattern="paper-f")
+        stamped = stamp_trigger(images, "mnist", 5)
         self.assertGreater(float(stamped[0, 0, 0, 0]), 0.0)
         self.assertGreater(float(stamped[0, 0, 2, 2]), 0.0)
         self.assertEqual(float(stamped[0, 0, -1, -1]), 0.0)
@@ -121,6 +99,30 @@ class ModelTests(unittest.TestCase):
                 output = model(torch.randn(*shape))
                 self.assertEqual(tuple(output.shape), (2, 10))
                 self.assertGreater(communicated_parameter_count(model, True), 0)
+
+    def test_paper_model_layer_counts_match_efficiency_profiles(self):
+        expected = {
+            "mnist": [576, 73728, 1605632, 2560],
+            "svhn": [
+                1728, 36864, 73728, 147456, 294912, 589824,
+                1179648, 2359296, 524288, 65536, 2560,
+            ],
+            "cifar10": [
+                1728, 36864, 36864, 36864, 36864,
+                73728, 147456, 8192, 147456, 147456,
+                294912, 589824, 32768, 589824, 589824,
+                1179648, 2359296, 131072, 2359296, 2359296, 5120,
+            ],
+        }
+        for dataset, counts in expected.items():
+            with self.subTest(dataset=dataset):
+                model = build_model(dataset, rank_based=True)
+                actual = [
+                    module.scores.numel()
+                    for module in model.modules()
+                    if hasattr(module, "scores")
+                ]
+                self.assertEqual(actual, counts)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -148,7 +150,7 @@ class ProtocolTests(unittest.TestCase):
         config = parse_args(
             [
                 "--dataset", "mnist",
-                "--method", "cmgra-px",
+                "--method", "cmgra",
                 "--attack", "vem",
                 "--malicious-fraction", "0.2",
                 "--n-clients", "1000",
@@ -171,19 +173,21 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(["--dataset", "mnist", "--method", "binary", *base])
 
-    def test_all_to_one_label_flip_target_is_explicit(self):
+    def test_pixel_backdoor_parameters_are_explicit(self):
         config = parse_args(
             [
                 "--dataset", "mnist",
                 "--method", "frl",
-                "--attack", "label_flip_all_to_one",
+                "--attack", "pixel_backdoor",
                 "--malicious-fraction", "0.2",
-                "--label-flip-target", "3",
+                "--backdoor-target", "2",
+                "--backdoor-examples", "9",
                 "--rounds", "1",
                 "--device", "cpu",
             ]
         )
-        self.assertEqual(config.label_flip_target, 3)
+        self.assertEqual(config.backdoor_target, 2)
+        self.assertEqual(config.backdoor_examples, 9)
 
 
 class GradientAggregatorTests(unittest.TestCase):

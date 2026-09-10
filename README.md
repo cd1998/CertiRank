@@ -24,8 +24,9 @@ CertiRank/
 |-- README.md
 |-- Efficiency evaluation/
 |   |-- README.md
-|   |-- certirank.py             # SEncode + RLWE-AHE + CMGRA workflow
-|   |-- certirank-bfv.py         # BFV native encoding + BFV + CMGRA workflow
+|   |-- certirank.py             # CertiRank launcher (SEncode + RLWE-AHE)
+|   |-- certirank-bfv.py         # CertiRank-BFV launcher
+|   |-- certirank_benchmark.py   # complete shared secure workflow
 |   |-- bcpbfl.py                # CKKS-based BCPBFL baseline
 |   |-- rvfl.py                  # Paillier/HEU-based RVPFL baseline
 |   |-- comparison.py            # cryptographic primitive benchmarks
@@ -78,7 +79,7 @@ python3 -m benchmark.vem_partition \
 python3 run_benchmark.py \
   --dataset cifar10 \
   --model resnet18 \
-  --method cmgra-px \
+  --method cmgra \
   --attack vem \
   --malicious-fraction 0.2 \
   --n-clients 1000 \
@@ -88,16 +89,24 @@ python3 run_benchmark.py \
   --partition-file partitions/cifar10_dirichlet_a1_seed0.pkl \
   --local-epochs 5 \
   --keep-ratio 0.5 \
-  --cmgra-borda-final-order \
   --device cuda
 ```
 
-The CLI identifier `cmgra-px` is retained for compatibility with the original
-experiment logs; it denotes the method named **CMGRA** in the paper.
 Checkpoints, `metrics.csv`, `summary.json`, and accuracy plots are written under
 the selected output directory. See
 [`Robustness evaluation/README.md`](Robustness%20evaluation/README.md) for the
 complete commands and attack settings.
+
+The canonical 168-run matrix for Table 8 (15 clean runs, 135 common-attack
+runs, and 18 VEM runs) can be generated with:
+
+```bash
+python3 -m benchmark.manifest --output paper_table8_manifest.jsonl
+```
+
+Every manifest row contains the complete command-line argument list, including
+the dataset-specific model, density, local epochs, optimizer settings,
+partition file, and CMGRA options.
 
 ## Quick start: efficiency experiments
 

@@ -1,31 +1,21 @@
-"""Focused FRL/CMGRA benchmark for MNIST, SVHN, and CIFAR10.
-
-The historical CLI identifier ``cmgra-px`` is retained so published run
-directories and checkpoints remain reproducible; it denotes CMGRA in the
-paper.
-"""
+"""Focused FRL/CMGRA benchmark for MNIST, SVHN, and CIFAR10."""
 
 MNIST_LIKE_DATASETS = ("mnist",)
 DATASETS = ("mnist", "svhn", "cifar10")
 
 GRADIENT_METHODS = ("fedavg", "bcpbfl", "rvpfl")
-RANK_METHODS = ("frl", "cmgra-px")
+RANK_METHODS = ("frl", "cmgra")
 ALL_METHODS = GRADIENT_METHODS + RANK_METHODS
 
 COMMON_ATTACKS = (
     "label_flip",
-    "gaussian_noise",
     "grad_ascent",
     "pixel_backdoor",
 )
-ADDITIONAL_COMMON_ATTACKS = ("label_flip_all_to_one",)
-PAPER_BACKDOOR_ATTACKS = ("pixel_backdoor_low_data",)
 RANK_ONLY_ATTACKS = ("vem",)
 ALL_ATTACKS = (
     ("clean",)
     + COMMON_ATTACKS
-    + ADDITIONAL_COMMON_ATTACKS
-    + PAPER_BACKDOOR_ATTACKS
     + RANK_ONLY_ATTACKS
 )
 
@@ -43,8 +33,6 @@ def attack_applies(method: str, attack: str) -> bool:
     if (
         attack == "clean"
         or attack in COMMON_ATTACKS
-        or attack in ADDITIONAL_COMMON_ATTACKS
-        or attack in PAPER_BACKDOOR_ATTACKS
     ):
         return True
     if attack in RANK_ONLY_ATTACKS:

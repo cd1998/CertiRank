@@ -21,13 +21,15 @@ Methods:
 - `bcpbfl`
 - `rvpfl`
 - `frl`
-- `cmgra-px` (the implementation identifier for CMGRA)
+- `cmgra`
 
 Reported attacks:
 
 - `label_flip`: class $l$ is changed to $f-l-1$;
 - `grad_ascent`: malicious local optimization follows the ascent direction;
-- `pixel_backdoor`: triggered samples are assigned to the target class;
+- `pixel_backdoor`: the FRL-paper artificial backdoor; each malicious client
+  receives the same nine examples stamped with a fixed $5\times5$ F-shaped
+  trigger and relabeled as class 2;
 - `vem`: the source-compatible VEM attack for rank-based methods.
 
 ## Main configurations
@@ -50,6 +52,15 @@ python3 -m benchmark.vem_partition \
   --output partitions/mnist_dirichlet_a1_seed0.pkl
 ```
 
+Repeat the command with `--dataset svhn` and `--dataset cifar10`, changing the
+output filename accordingly. The canonical Table-8 manifest expects:
+
+```text
+partitions/mnist_dirichlet_a1_seed0.pkl
+partitions/svhn_dirichlet_a1_seed0.pkl
+partitions/cifar10_dirichlet_a1_seed0.pkl
+```
+
 ## Single-run examples
 
 CMGRA under VEM:
@@ -57,12 +68,12 @@ CMGRA under VEM:
 ```bash
 python3 run_benchmark.py \
   --dataset mnist --model conv2 \
-  --method cmgra-px --attack vem --malicious-fraction 0.2 \
+  --method cmgra --attack vem --malicious-fraction 0.2 \
   --n-clients 1000 --round-clients 25 --rounds 500 \
   --data-partition legacy-vem \
   --partition-file partitions/mnist_dirichlet_a1_seed0.pkl \
   --local-epochs 1 --keep-ratio 0.2 --seed 0 --partition-seed 0 \
-  --cmgra-borda-final-order --device cuda
+  --device cuda
 ```
 
 FRL under the same attack:
@@ -85,7 +96,29 @@ python3 run_benchmark.py \
   --dataset cifar10 --model resnet18 \
   --method fedavg --attack clean --malicious-fraction 0 \
   --n-clients 1000 --round-clients 25 --rounds 500 \
+  --data-partition legacy-vem \
+  --partition-file partitions/cifar10_dirichlet_a1_seed0.pkl \
+  --local-epochs 5 --seed 0 --partition-seed 0 \
   --device cuda
+```
+
+## Reproduce Table 8
+
+Generate the complete experiment manifest:
+
+```bash
+python3 -m benchmark.manifest --output paper_table8_manifest.jsonl
+```
+
+The manifest contains 168 runs: five clean baselines per dataset; all five
+methods under Label Flipping, Gradient Ascent, and Pixel Backdoor at 10%, 20%,
+and 30%; and FRL/CMGRA under VEM at the same three ratios. Every row contains
+the complete dataset-specific argument list. Launch one worker per GPU, for
+example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m benchmark.worker \
+  --manifest paper_table8_manifest.jsonl --device cuda
 ```
 
 The simulator automatically resumes from its latest checkpoint when the same

@@ -146,7 +146,7 @@ def _adjusted_cosine(update, benchmark, eps: float) -> float:
     return float((numerator / denominator).clamp(-1, 1))
 
 
-def rvpfl(updates, paper_extra_division: bool = False, eps: float = 1e-12):
+def rvpfl(updates, eps: float = 1e-12):
     """RVPFL Algorithm lines 9 and 16--18, without encryption."""
     finite = _finite_updates(updates)
     if not finite:
@@ -169,9 +169,6 @@ def rvpfl(updates, paper_extra_division: bool = False, eps: float = 1e-12):
         )
     weights = scores / scores.sum()
     aggregate = _weighted_sum(finite, weights)
-    if paper_extra_division:
-        for tensor in aggregate:
-            tensor.div_(int(positive.sum()))
     accepted = int(positive.sum())
     return aggregate, AggregationDiagnostics(
         accepted, len(updates) - accepted, weights.cpu().tolist(), similarities

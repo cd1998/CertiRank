@@ -1,4 +1,4 @@
-"""Regression tests for the retained CMGRA-PX aggregation path."""
+"""Regression tests for the CMGRA aggregation path."""
 
 import unittest
 
@@ -79,10 +79,12 @@ class CMGRATest(unittest.TestCase):
         restored.load_state_dict(original.state_dict())
         self.assertTrue(torch.equal(original.membership("layer"), restored.membership("layer")))
 
-    def test_retired_membership_only_variants_are_rejected(self):
-        for variant in ("cmgra-px-m", "binary"):
-            with self.subTest(variant=variant), self.assertRaises(ValueError):
-                CMGRAAggregator(0.5, max_malicious=0, aggregation_variant=variant)
+    def test_membership_only_input_is_rejected(self):
+        server = CMGRAAggregator(0.5, max_malicious=0)
+        with self.assertRaises(ValueError):
+            server.aggregate_layer(
+                "layer", torch.tensor([[1, 1, 0, 0]]), input_format="membership"
+            )
 
 
 if __name__ == "__main__":
