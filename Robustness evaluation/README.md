@@ -3,7 +3,6 @@
 This directory contains the plaintext federated-learning simulator used for
 the robustness results. It implements the three dataset/model pairs in the
 paper, five aggregation methods, and four reported poisoning attacks.
-The values reported in the paper are included in `paper_results.csv`.
 
 ## Install
 

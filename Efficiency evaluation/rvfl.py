@@ -1,15 +1,11 @@
 
-# # mnist_layer = [288,18432,1605632,1280]
-# # svhn_layer = [1728,36864,73728,147456,294912,589824,1179648,2359296,524288,65536,2560]
-# # cifar10_layer = [1728,36864,36864,36864,36864,73728,147456,8192,147456,147456,294912,589824,32768,589824,589824,1179648,2359296,131072,2359296,2359296,5120]
-
 import numpy as np
 from tqdm import tqdm
 from heu import phe
 import time
 
 NUM_CLIENTS = 1
-mnist_layer = [28,1843,160563,128]
+mnist_layer = [576, 73728, 1605632, 2560]
 TOTAL_DIM = sum(mnist_layer)
 
 # Paillier init
